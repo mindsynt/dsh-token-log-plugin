@@ -1,0 +1,3 @@
+- insert:
+    - id: token-log
+      name: '@local/dsh-token-log'

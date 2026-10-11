@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Token Usage Ledger",
+    "description": "Live token and cost dashboard: hourly today, last 30 days, and per-workspace totals, priced per model, time of day, and holiday."
+  }
+}
