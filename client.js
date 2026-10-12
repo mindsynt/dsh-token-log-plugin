@@ -931,9 +931,15 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         let live = true;
+        let inflight = false;
         let controller = null;
 
         const refresh = async () => {
+          // Skip a tick if the previous request is still in flight, so a slow
+          // response never queues up behind a faster one and an older body can
+          // never overwrite a newer one.
+          if (!live || inflight) return;
+          inflight = true;
           controller = new AbortController();
           try {
             const response = await fetch(STATS_PATH, {
@@ -953,6 +959,8 @@ window.__ModuleLoader__.load({
             if (live && !(reason && reason.name === 'AbortError')) {
               setError(String((reason && reason.message) || reason));
             }
+          } finally {
+            inflight = false;
           }
         };
 

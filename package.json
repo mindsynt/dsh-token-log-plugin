@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-token-log",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Live token and cost dashboard: hourly today, last 30 days, and per-workspace totals, priced per model, time of day, and holiday.",
   "private": true,
   "type": "module",

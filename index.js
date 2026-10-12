@@ -47,6 +47,8 @@ const DEFAULT_DAILY_DAYS = 30
 const MAX_LOADED_BUCKETS = 40000
 const FLUSH_AFTER_MS = 1500
 const SWEEP_AFTER_MS = 5 * 60 * 1000
+const SWEEP_CHECK_MS = 30 * 1000
+const SWEEP_CONCURRENCY = 6
 const MAX_SWEEP_SESSIONS = 400
 const CLEAR_CONCURRENCY = 16
 const PRICE_UNIT = 1_000_000
@@ -127,17 +129,19 @@ function makePartsOf(timeZone) {
     minute: '2-digit',
     second: '2-digit'
   })
+  // format() is about half the cost of formatToParts(): V8 skips building an
+  // array of part objects, and the en-GB output for this fixed option set is
+  // "DD/MM/YYYY, HH:mm:ss", so positional slicing recovers every field.
   return (timestamp) => {
-    const parts = { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0 }
-    for (const part of formatter.formatToParts(new Date(timestamp))) {
-      if (part.type === 'year') parts.year = Number(part.value)
-      else if (part.type === 'month') parts.month = Number(part.value)
-      else if (part.type === 'day') parts.day = Number(part.value)
-      else if (part.type === 'hour') parts.hour = Number(part.value)
-      else if (part.type === 'minute') parts.minute = Number(part.value)
-      else if (part.type === 'second') parts.second = Number(part.value)
+    const s = formatter.format(new Date(timestamp))
+    return {
+      day: Number(s.slice(0, 2)),
+      month: Number(s.slice(3, 5)),
+      year: Number(s.slice(6, 10)),
+      hour: Number(s.slice(12, 14)),
+      minute: Number(s.slice(15, 17)),
+      second: Number(s.slice(18, 20))
     }
-    return parts
   }
 }
 
@@ -276,6 +280,7 @@ function normalizeSettings(raw) {
 }
 
 const holidayCaches = new WeakMap()
+const rateCaches = new WeakMap()
 
 function holidaySetOf(settings) {
   let set = holidayCaches.get(settings)
@@ -287,42 +292,68 @@ function holidaySetOf(settings) {
 }
 
 /**
- * The active rate set for one model at one instant: the holiday rates when the
+ * Parse one model entry's rates and tier boundaries once, then reuse them for
+ * every bucket. settings is replaced wholesale on save, so a WeakMap keyed on
+ * the entry never serves a stale price.
+ */
+function ratesOf(entry) {
+  let cached = rateCaches.get(entry)
+  if (cached === undefined) {
+    const tiers = []
+    for (const tier of entry.tiers) {
+      const from = Number(tier.from.slice(0, 2)) * 60 + Number(tier.from.slice(3, 5))
+      const to = Number(tier.to.slice(0, 2)) * 60 + Number(tier.to.slice(3, 5))
+      if (to === from) continue
+      tiers.push({ from, to, multiplier: tier.multiplier })
+    }
+    cached = {
+      base: {
+        input: number(entry.input),
+        cacheInput: number(entry.cacheInput),
+        output: number(entry.output)
+      },
+      holiday: entry.holidayRates === null ? null : {
+        input: number(entry.holidayRates.input),
+        cacheInput: number(entry.holidayRates.cacheInput),
+        output: number(entry.holidayRates.output)
+      },
+      tiers
+    }
+    rateCaches.set(entry, cached)
+  }
+  return cached
+}
+
+/**
+ * The cost of one model's counts at one instant: the holiday rates when the
  * date is a listed holiday and the model declares them, otherwise the base
  * rates, then the first matching time-of-day tier's multiplier applied to all
  * three. Returns null when the model has no entry, which prices it as unpriced
  * rather than as free.
+ *
+ * `dateKey` and `holiday` are precomputed by the caller: every bucket in the
+ * aggregation shares them, so deriving them again per model call was pure
+ * duplication. The counts are folded straight into the result so the call
+ * allocates nothing — at 9 600 buckets the previous rate+countCost pair built
+ * 38 400 throwaway objects per snapshot.
  */
-function rateFor(settings, modelId, parts) {
+function costFor(settings, modelId, parts, dateKey, holiday, counts) {
   const entry = settings.models[modelId]
   if (entry === undefined) return null
-  const holiday = holidaySetOf(settings).has(dateKeyOf(parts))
-  const base = holiday && entry.holidayRates ? entry.holidayRates : entry
+  const cached = ratesOf(entry)
+  const base = holiday && cached.holiday ? cached.holiday : cached.base
   const minute = parts.hour * 60 + parts.minute
   let multiplier = 1
-  for (const tier of entry.tiers) {
-    const from = Number(tier.from.slice(0, 2)) * 60 + Number(tier.from.slice(3, 5))
-    const to = Number(tier.to.slice(0, 2)) * 60 + Number(tier.to.slice(3, 5))
-    if (to === from) continue
-    const hit = to > from ? (minute >= from && minute < to) : (minute >= from || minute < to)
+  for (const tier of cached.tiers) {
+    const hit = tier.to > tier.from ? (minute >= tier.from && minute < tier.to) : (minute >= tier.from || minute < tier.to)
     if (hit) {
       multiplier = tier.multiplier
       break
     }
   }
-  return {
-    input: number(base.input) * multiplier,
-    cacheInput: number(base.cacheInput) * multiplier,
-    output: number(base.output) * multiplier,
-    holiday,
-    multiplier
-  }
-}
-
-function countCost(counts, rate) {
-  return (counts.input * rate.input
-    + (counts.cacheRead + counts.cacheWrite) * rate.cacheInput
-    + counts.output * rate.output) / PRICE_UNIT
+  return (counts.input * base.input
+    + (counts.cacheRead + counts.cacheWrite) * base.cacheInput
+    + counts.output * base.output) / PRICE_UNIT * multiplier
 }
 
 /* --------------------------------------------------------------- */
@@ -359,6 +390,7 @@ function buildSnapshot(buckets, settings, storage) {
   const modelAgg = new Map()
   const workspaceAgg = new Map()
   const hourly = new Map()
+  const dailyAgg = new Map()
 
   for (const bucket of buckets.values()) {
     const parts = partsOf(bucket.time)
@@ -371,12 +403,11 @@ function buildSnapshot(buckets, settings, storage) {
       addTokens(tokens, counts)
       const model = modelAgg.get(modelId) ?? { model: modelId, ...zeroTokens(), cost: 0 }
       addTokens(model, counts)
-      const rate = rateFor(settings, modelId, parts)
-      if (rate === null) {
+      const cost = costFor(settings, modelId, parts, dateKey, holiday, counts)
+      if (cost === null) {
         unpricedTokens += counts.input + counts.cacheRead + counts.cacheWrite + counts.output
         unpricedModels.add(modelId)
       } else {
-        const cost = countCost(counts, rate)
         bucketCost += cost
         totalCost += cost
         model.cost += cost
@@ -395,12 +426,12 @@ function buildSnapshot(buckets, settings, storage) {
       if (workspace.title) identity.title = workspace.title
       for (const [modelId, counts] of Object.entries(workspace.models ?? {})) {
         addTokens(identity, counts)
-        const rate = rateFor(settings, modelId, parts)
-        if (rate === null) {
+        const cost = costFor(settings, modelId, parts, dateKey, holiday, counts)
+        if (cost === null) {
           identity.unpriced += counts.input + counts.cacheRead + counts.cacheWrite + counts.output
           continue
         }
-        identity.cost += countCost(counts, rate)
+        identity.cost += cost
       }
       workspaceAgg.set(workspace.path, identity)
     }
@@ -412,6 +443,13 @@ function buildSnapshot(buckets, settings, storage) {
       holiday
     })
     addTokens(totals, tokens)
+
+    // Fold this bucket into its day in the same pass, so the daily series is a
+    // single linear scan instead of 30 × N lookups.
+    const day = dailyAgg.get(dateKey) ?? { tokens: zeroTokens(), cost: 0 }
+    addTokens(day.tokens, tokens)
+    day.cost += bucketCost
+    dailyAgg.set(dateKey, day)
   }
 
   const todayTokens = zeroTokens()
@@ -449,27 +487,19 @@ function buildSnapshot(buckets, settings, storage) {
     })
   }
 
+  // The daily series is read straight from the fold above; absent days are
+  // zero-filled so the chart keeps a continuous 30-point shape.
   const daily = []
   for (let index = DEFAULT_DAILY_DAYS - 1; index >= 0; index -= 1) {
     const key = dateKeyOf(partsOf(shiftBack(now, index * 24 * 60, partsOf)))
-    const tokens = zeroTokens()
-    let cost = 0
-    let active = false
-    let holiday = false
-    for (const [bucketKey, hit] of hourly) {
-      if (!bucketKey.startsWith(`${key}T`)) continue
-      active = true
-      addTokens(tokens, hit.tokens)
-      cost += hit.cost
-      holiday = holiday || hit.holiday
-    }
+    const hit = dailyAgg.get(key)
     daily.push({
       key,
       label: `${Number(key.slice(5, 7))}/${Number(key.slice(8, 10))}`,
-      tokens,
-      cost,
-      active,
-      holiday
+      tokens: hit === undefined ? zeroTokens() : hit.tokens,
+      cost: hit === undefined ? 0 : hit.cost,
+      active: hit !== undefined,
+      holiday: holidays.has(key)
     })
   }
 
@@ -776,6 +806,10 @@ function createLedger(ctx) {
    * Count what the live feed could not see: usage recorded before the plugin
    * was first enabled, or while it was disabled. Each session's high-water mark
    * makes the sweep idempotent against the live feed and against itself.
+   *
+   * Sessions are read concurrently: each readSession decompresses and replays a
+   * full zstd log, so serialising them is the dominant cost. recordUsage is
+   * synchronous, so batching reads in parallel is safe.
    */
   async function sweep() {
     if (sweepRunning) return
@@ -788,22 +822,27 @@ function createLedger(ctx) {
     sweepRunning = true
     try {
       const records = await listSessions.call(sessionQuery, [])
-      let reads = 0
+      const target = []
       for (const record of records) {
-        if (reads >= MAX_SWEEP_SESSIONS) break
+        if (target.length >= MAX_SWEEP_SESSIONS) break
         const sessionId = String(record?.header?.id ?? '')
         if (sessionId === '') continue
-        try {
-          const snapshot = await sessionQuery.readSession(sessionId)
-          reads += 1
-          const cwd = snapshot.session?.cwd ?? record?.header?.cwd
-          for (const event of snapshot.events ?? []) {
-            if (event?.type !== 'assistant/message') continue
-            recordUsage(sessionId, cwd, event)
+        target.push({ id: sessionId, cwd: record?.header?.cwd })
+      }
+      for (let index = 0; index < target.length; index += SWEEP_CONCURRENCY) {
+        const batch = target.slice(index, index + SWEEP_CONCURRENCY)
+        await Promise.all(batch.map(async (entry) => {
+          try {
+            const snapshot = await sessionQuery.readSession(entry.id)
+            const cwd = snapshot.session?.cwd ?? entry.cwd
+            for (const event of snapshot.events ?? []) {
+              if (event?.type !== 'assistant/message') continue
+              recordUsage(entry.id, cwd, event)
+            }
+          } catch (error) {
+            ctx.logger?.warn?.(`token-log: session "${entry.id}" could not be swept: ${String(error?.message ?? error)}`)
           }
-        } catch (error) {
-          ctx.logger?.warn?.(`token-log: session "${sessionId}" could not be swept: ${String(error?.message ?? error)}`)
-        }
+        }))
       }
       prune(settings)
       await flush()
@@ -823,6 +862,7 @@ function createLedger(ctx) {
     recordUsage,
     sweep,
     dueSweep: () => Date.now() - lastSweep > SWEEP_AFTER_MS && !sweepRunning,
+    sweepStatus: () => sweepRunning ? 'running' : (Date.now() - lastSweep > SWEEP_AFTER_MS ? 'pending' : 'idle'),
     clear: () => serialize(async () => {
       const keys = [...buckets.keys()]
       buckets.clear()
@@ -855,9 +895,12 @@ function createLedger(ctx) {
     }),
     snapshot: () => {
       const ordered = [...buckets.keys()].sort()
+      // settings is passed by reference: buildSnapshot only reads it, and the
+      // result is serialised by json(), so no clone is needed. Keeping the same
+      // reference is what makes the rate/tier caches keyed on settings hit.
       return buildSnapshot(
         buckets,
-        structuredClone(settings),
+        settings,
         {
           durable: unit !== null,
           error: storageError,
@@ -898,8 +941,20 @@ export const inject = ['connection']
 export function apply(ctx) {
   const ledger = createLedger(ctx)
 
+  // Load the ledger, then backfill in the background. The first sweep starts as
+  // soon as load resolves so a cold start is not an empty dashboard, and a timer
+  // keeps the corpus caught up afterwards. A request never waits on a sweep: it
+  // reads whatever the ledger already holds and reports the backfill status
+  // alongside it, so the tab opens immediately instead of blocking on a
+  // multi-second corpus pass.
   ctx.effect(async () => {
     await ledger.load()
+    if (ledger.dueSweep()) void ledger.sweep()
+    const timer = setInterval(() => {
+      if (ledger.dueSweep()) void ledger.sweep()
+    }, SWEEP_CHECK_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearInterval(timer)
   }, 'token-log: load ledger')
 
   // Usage arrives on the post-commit append feed; counting is synchronous and
@@ -926,11 +981,10 @@ export function apply(ctx) {
       fetch: async () => {
         try {
           await ledger.flush()
-          // Await the sweep rather than firing it in the background: the first
-          // read after a cold start is otherwise an empty dashboard that only
-          // fills on the next poll, and the sweep is capped to one corpus pass.
-          if (ledger.dueSweep()) await ledger.sweep()
-          return json(ledger.snapshot())
+          // The backfill runs out of band; report its status so the client can
+          // show a "catching up" hint instead of rendering an empty dashboard.
+          const snapshot = ledger.snapshot()
+          return json({ ...snapshot, backfill: { status: ledger.sweepStatus() } })
         } catch (error) {
           ctx.logger?.warn?.('token-log: stats failed: ' + String(error?.message ?? error))
           return json({ ok: false, error: String(error?.message ?? error) }, 500)
